@@ -1,10 +1,16 @@
-name: Build and Push Docker Images (Compose) to Aliyun Registry
+name: Build and Push Docker Images to Aliyun Registry
 
 on:
   push:
     branches:
       - main
       - master
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   build-and-push:
@@ -14,6 +20,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to Aliyun Docker Registry
         uses: docker/login-action@v3
         with:
@@ -21,7 +30,281 @@ jobs:
           username: ${{ secrets.ALIYUN_USERNAME }}
           password: ${{ secrets.ALIYUN_PASSWORD }}
 
-      - name: Build and Push Docker image using Compose
+      - name: Extract metadata for app
+        id: meta-app
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/c3c/weknora-app
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Extract metadata for frontend
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/c3c/weknora-frontend
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Extract metadata for docreader
+        id: meta-docreader
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/c3c/weknora-docreader
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build and push app image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.app
+          push: true
+          tags: ${{ steps.meta-app.outputs.tags }}
+          labels: ${{ steps.meta-app.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push docreader image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.docreader
+          push: true
+          tags: ${{ steps.meta-docreader.outputs.tags }}
+          labels: ${{ steps.meta-docreader.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            PLATFORM=linux/amd64
+
+      - name: Create deployment compose file
         run: |
-          docker compose build
-          docker compose push
+          # Create a deployment docker-compose file with pushed images
+          cat > docker-compose.deploy.yml << EOF
+          # WeKnora 部署配置文件
+          # 使用前请：
+          # 1. 复制 .env.example 为 .env
+          # 2. 根据实际环境修改 .env 中的配置
+          # 3. 运行: docker compose -f docker-compose.deploy.yml up -d
+
+          services:
+            app:
+              image: ${{ env.REGISTRY }}/c3c/weknora-app:${{ env.IMAGE_TAG }}
+              container_name: WeKnora-app
+              ports:
+                - "8080:8080"
+              volumes:
+                - data-files:/data/files
+                - ./config:/app/config
+              env_file:
+                - .env
+              environment:
+                - DB_HOST=postgres
+                - DOCREADER_ADDR=docreader:50051
+                - REDIS_ADDR=redis:6379
+                - MINIO_ENDPOINT=minio:9000
+                - OTEL_EXPORTER_OTLP_ENDPOINT=jaeger:4317
+                - OTEL_SERVICE_NAME=WeKnora
+                - OTEL_TRACES_EXPORTER=otlp
+                - OTEL_METRICS_EXPORTER=none
+                - OTEL_LOGS_EXPORTER=none
+                - OTEL_PROPAGATORS=tracecontext,baggage
+                - TZ=Asia/Shanghai
+              depends_on:
+                redis:
+                  condition: service_started
+                postgres:
+                  condition: service_healthy
+              networks:
+                - WeKnora-network
+              restart: unless-stopped
+              extra_hosts:
+                - "host.docker.internal:host-gateway"
+
+            frontend:
+              image: ${{ env.REGISTRY }}/c3c/weknora-frontend:${{ env.IMAGE_TAG }}
+              container_name: WeKnora-frontend
+              ports:
+                - "80:80"
+              depends_on:
+                - app
+              networks:
+                - WeKnora-network
+              restart: unless-stopped
+
+            docreader:
+              image: ${{ env.REGISTRY }}/c3c/weknora-docreader:${{ env.IMAGE_TAG }}
+              container_name: WeKnora-docreader
+              ports:
+                - "50051:50051"
+              env_file:
+                - .env
+              networks:
+                - WeKnora-network
+              restart: unless-stopped
+              extra_hosts:
+                - "host.docker.internal:host-gateway"
+
+            postgres:
+              image: paradedb/paradedb:latest
+              container_name: WeKnora-postgres
+              ports:
+                - "\${DB_PORT:-5432}:5432"
+              environment:
+                - POSTGRES_USER=\${DB_USER:-postgres}
+                - POSTGRES_PASSWORD=\${DB_PASSWORD}
+                - POSTGRES_DB=\${DB_NAME:-WeKnora}
+              volumes:
+                - postgres-data:/var/lib/postgresql/data
+                - ./migrations/paradedb:/docker-entrypoint-initdb.d
+              networks:
+                - WeKnora-network
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U \${DB_USER:-postgres}"]
+                interval: 10s
+                timeout: 10s
+                retries: 3
+                start_period: 30s
+              restart: unless-stopped
+              stop_grace_period: 1m
+
+            redis:
+              image: redis:7.0-alpine
+              container_name: WeKnora-redis
+              ports:
+                - "\${REDIS_PORT:-6379}:6379"
+              volumes:
+                - redis_data:/data
+              command: redis-server --appendonly yes --requirepass \${REDIS_PASSWORD}
+              restart: always
+              networks:
+                - WeKnora-network
+
+            # 可选组件：如果需要MinIO对象存储，取消注释
+            # minio:
+            #   image: minio/minio:latest
+            #   container_name: WeKnora-minio
+            #   ports:
+            #     - "\${MINIO_PORT:-9000}:9000"
+            #     - "\${MINIO_CONSOLE_PORT:-9001}:9001"
+            #   environment:
+            #     - MINIO_ROOT_USER=\${MINIO_ACCESS_KEY_ID:-minioadmin}
+            #     - MINIO_ROOT_PASSWORD=\${MINIO_SECRET_ACCESS_KEY:-minioadmin}
+            #   command: server --console-address ":9001" /data
+            #   volumes:
+            #     - minio_data:/data
+            #   networks:
+            #     - WeKnora-network
+
+            # 可选组件：如果需要链路追踪，取消注释
+            # jaeger:
+            #   image: jaegertracing/all-in-one:latest
+            #   ports:
+            #     - "16686:16686"
+            #     - "4317:4317"
+            #     - "4318:4318"
+            #   environment:
+            #     - COLLECTOR_OTLP_ENABLED=true
+            #   volumes:
+            #     - jaeger_data:/var/lib/jaeger
+            #   networks:
+            #     - WeKnora-network
+            #   restart: unless-stopped
+
+          networks:
+            WeKnora-network:
+              driver: bridge
+
+          volumes:
+            postgres-data:
+            data-files:
+            redis_data:
+            # minio_data:    # 如果使用MinIO，取消注释
+            # jaeger_data:   # 如果使用Jaeger，取消注释
+          EOF
+
+          # 创建简化的部署说明
+          cat > DEPLOY.md << EOF
+          # WeKnora 部署指南
+
+          ## 快速部署
+
+          1. 下载部署文件:
+             \`\`\`bash
+             # 从GitHub Actions artifacts下载或手动复制以下文件：
+             # - docker-compose.deploy.yml
+             # - .env.example
+             \`\`\`
+
+          2. 配置环境变量:
+             \`\`\`bash
+             cp .env.example .env
+             # 编辑 .env 文件，配置数据库密码、模型等参数
+             \`\`\`
+
+          3. 启动服务:
+             \`\`\`bash
+             docker compose -f docker-compose.deploy.yml up -d
+             \`\`\`
+
+          4. 访问服务:
+             - Web界面: http://localhost
+             - API接口: http://localhost:8080
+
+          ## 可选组件
+
+          如需要以下功能，请编辑 docker-compose.deploy.yml 取消相应注释：
+          - MinIO 对象存储服务
+          - Jaeger 链路追踪服务
+
+          ## 常用命令
+
+          \`\`\`bash
+          # 查看服务状态
+          docker compose -f docker-compose.deploy.yml ps
+
+          # 查看日志
+          docker compose -f docker-compose.deploy.yml logs -f
+
+          # 停止服务
+          docker compose -f docker-compose.deploy.yml down
+
+          # 更新镜像
+          docker compose -f docker-compose.deploy.yml pull
+          docker compose -f docker-compose.deploy.yml up -d
+          \`\`\`
+          EOF
+
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-files
+          path: |
+            docker-compose.deploy.yml
+            .env.example
+            DEPLOY.md
+          retention-days: 30
